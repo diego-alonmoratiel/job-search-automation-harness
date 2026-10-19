@@ -1,0 +1,16 @@
+[Unit]
+Description=Job-search Telegram bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/job-harness
+ExecStart=%h/job-harness/bin/tg-bridge
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.opencode/bin:%h/.bun/bin:%h/.pi/agent/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

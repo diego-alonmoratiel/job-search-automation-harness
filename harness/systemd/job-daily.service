@@ -1,0 +1,11 @@
+[Unit]
+Description=Job-search daily scrape + rank + shortlist
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/job-harness
+ExecStart=%h/job-harness/bin/jobctl daily
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.opencode/bin:%h/.bun/bin:%h/.pi/agent/bin:/usr/local/bin:/usr/bin:/bin

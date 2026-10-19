@@ -1,0 +1,13 @@
+[Unit]
+Description=Xvfb virtual display :99 for browser automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x900x24 -nolisten tcp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

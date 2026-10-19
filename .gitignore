@@ -1,0 +1,15 @@
+# Secrets and local state - never commit
+harness/config/harness.env
+harness/config/answers.json
+harness/config/key.txt
+**/key.txt
+harness/state/*
+!harness/state/.gitkeep
+
+# Dependencies
+harness/browser/node_modules/
+harness/spikes/*/node_modules/
+
+# Python
+__pycache__/
+*.pyc

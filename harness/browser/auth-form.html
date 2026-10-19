@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Test Auth Form</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 3rem auto; }
+    label { display: block; margin-top: 0.8rem; font-weight: 600; }
+    input, button { width: 100%; padding: 0.5rem; box-sizing: border-box; margin-top: 0.3rem; }
+    #codeStep { display: none; margin-top: 1rem; border-top: 1px solid #ccc; padding-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Create your account</h1>
+  <form id="signup" onsubmit="event.preventDefault(); document.getElementById('codeStep').style.display='block';">
+    <label for="email">Email *</label>
+    <input id="email" name="email" type="email" required />
+
+    <label for="password">Password *</label>
+    <input id="password" name="password" type="password" required />
+
+    <label for="password2">Confirm password *</label>
+    <input id="password2" name="password_confirm" type="password" required />
+
+    <button type="submit">Create account</button>
+  </form>
+
+  <div id="codeStep">
+    <h2>Verify your email</h2>
+    <p>We sent a verification code to your email.</p>
+    <form onsubmit="event.preventDefault(); document.getElementById('done').hidden=false;">
+      <label for="code">Verification code *</label>
+      <input id="code" name="verification_code" required />
+      <button type="submit">Verify</button>
+    </form>
+    <p id="done" hidden>Account verified (test).</p>
+  </div>
+</body>
+</html>

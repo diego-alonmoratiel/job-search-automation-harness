@@ -1,0 +1,8 @@
+{
+  "name": "dom-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "latest"
+  }
+}

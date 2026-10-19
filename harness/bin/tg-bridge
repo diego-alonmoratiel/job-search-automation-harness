@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""tg-bridge - Telegram long-polling bridge for the job-search harness.
+
+Only messages from the configured owner id are accepted. The bridge never
+executes anything found inside message text other than its own small command
+vocabulary; job postings are never instructions.
+
+Commands understood from the owner:
+  <numbers>        e.g. "1 3"  -> run /apply for those shortlist offers
+  ok | dale | si   -> approve (used by the form-filling phase)
+  status           -> send a status summary
+  daily | scrape   -> trigger the daily scrape + rank + shortlist
+  lista | resend   -> re-send the current shortlist
+  help             -> command list
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import harness  # noqa: E402
+
+URL_RE = re.compile(r"https?://[^\s<>\"')]+")
+
+
+def _extract_url(text: str) -> str | None:
+    m = URL_RE.search(text)
+    return m.group(0) if m else None
+
+HELP = (
+    "Comandos:\n"
+    "- numeros, ej. '1 3' -> prepara esas candidaturas\n"
+    "- fill <n> -> rellena el formulario de la oferta n\n"
+    "- puntua <url> -> puntua una oferta (encaje + idioma + ubicacion), sin redactar ni rellenar\n"
+    "- (si te pide un dato) responde el valor, o 'skip' para dejarlo en blanco\n"
+    "- (si te pide un codigo de verificacion) pasamelo y lo introduzco sin recargar\n"
+    "- ok -> continua la candidatura en curso (rellena si es borrador, envia si ya esta rellenada)\n"
+    "- no -> cancela el envio pendiente\n"
+    "- lista -> reenvia la shortlist actual\n"
+    "- status -> resumen de estado\n"
+    "- daily -> lanza scrape + rank ahora\n"
+    "- un link (URL) -> si estas atascado lo reapunta; si no, redacta candidatura nueva\n"
+    "- cualquier texto en lenguaje natural -> lo interpreto y actuo\n"
+    "- help -> esta ayuda"
+)
+
+
+def _jobctl(*args: str) -> int:
+    script = Path(__file__).resolve().parent / "jobctl"
+    return subprocess.run([sys.executable, str(script), *args]).returncode
+
+
+def _handle_ok(config: dict, state: dict) -> None:
+    apps = state.get("applications", {})
+    cur = state.get("current")
+    stage = apps.get(cur, {}).get("stage") if cur else None
+    if cur and stage in ("drafted", "retargeted", "failed"):
+        _jobctl("fill", cur)
+        return
+    if cur and stage == "awaiting_ok":
+        _jobctl("submit", cur)
+        return
+    if cur and stage == "stuck":
+        harness.tg_send(config, "La candidatura en curso esta atascada. Mandame un link directo o resuelvela por VNC.")
+        return
+    # No current: act only if there is exactly one application awaiting ok.
+    awaiting = [u for u, a in apps.items() if a.get("stage") == "awaiting_ok"]
+    if len(awaiting) == 1:
+        _jobctl("submit", awaiting[0])
+        return
+    harness.tg_send(config, "No hay ninguna candidatura en curso. Mandame numeros de la shortlist, 'lista' o un link.")
+
+
+def _handle_no(config: dict, state: dict) -> None:
+    cur = state.get("current")
+    if cur and cur in state.get("applications", {}):
+        state["applications"][cur]["stage"] = "cancelled"
+        state["current"] = None
+        harness.save_state(state)
+        harness.tg_send(config, "Cancelado. No se envia nada.")
+    else:
+        harness.tg_send(config, "No hay nada que cancelar.")
+
+
+def _answer_pending(config: dict, state: dict, pending: dict, text: str) -> None:
+    url = pending["url"]
+    if pending.get("type") == "verify_code":
+        code = text.strip()
+        state["pending_input"] = None
+        harness.save_state(state)
+        _jobctl("verify", url, code)
+        return
+    field = (pending.get("fields") or [{}])[0]
+    key = field.get("key")
+    value = "" if text.strip().lower() in ("skip", "saltar", "omitir", "blanco") else text.strip()
+    app = state.setdefault("applications", {}).setdefault(url, {})
+    if key:
+        app.setdefault("overrides", {})[key] = value
+    app["stage"] = "filling"
+    state["pending_input"] = None
+    harness.save_state(state)
+    _jobctl("fill", url)
+
+
+def handle(config: dict, text: str) -> None:
+    low = text.strip().lower()
+    if not low:
+        return
+    state = harness.load_state()
+    pending = state.get("pending_input")
+    if pending and pending.get("fields"):
+        _answer_pending(config, state, pending, text)
+        return
+    tokens = low.replace(",", " ").split()
+    if tokens and all(t.isdigit() for t in tokens):
+        for t in tokens:
+            _jobctl("apply", t)
+        return
+    if tokens and tokens[0] in ("fill", "rellenar") and len(tokens) > 1:
+        _jobctl("fill", tokens[1])
+        return
+    if low in ("ok", "dale", "si", "sí", "envia", "envía", "aprobado"):
+        _handle_ok(config, state)
+        return
+    if low in ("no", "cancelar", "cancela"):
+        _handle_no(config, state)
+        return
+    if low in ("status", "estado"):
+        _jobctl("status")
+        return
+    if low in ("daily", "scrape", "buscar"):
+        _jobctl("daily")
+        return
+    if low in ("lista", "resend", "shortlist"):
+        _jobctl("resend")
+        return
+    if low in ("help", "ayuda", "?"):
+        harness.tg_send(config, HELP)
+        return
+    url = _extract_url(text)
+    if url and tokens and tokens[0] in ("puntua", "puntuar", "puntúa", "score", "rankea", "puntuacion", "puntuación"):
+        _jobctl("score", url)
+        return
+    if url and len(text.split()) <= 10:
+        # Short message built around a link: act on it.
+        apps = state.get("applications", {})
+        cur = state.get("current")
+        cur_stage = apps.get(cur, {}).get("stage") if cur else None
+        if state.get("stuck") or cur_stage in ("drafted", "retargeted", "failed", "stuck", "awaiting_ok"):
+            _jobctl("retarget", url)
+        else:
+            _jobctl("apply", url)
+        return
+    # Anything else is free-form: let the conversational agent interpret it.
+    _jobctl("say", text)
+
+
+def main() -> int:
+    config = harness.load_config()
+    if not config.get("TELEGRAM_BOT_TOKEN") or not config.get("TELEGRAM_OWNER_ID"):
+        harness.log("tg-bridge: Telegram credentials missing, exiting")
+        return 1
+    owner = str(config["TELEGRAM_OWNER_ID"])
+    harness.log(f"tg-bridge: starting for owner {owner}")
+
+    backoff = 1
+    while True:
+        with harness.StateLock():
+            state = harness.load_state()
+        offset = int(state.get("telegram_offset", 0))
+        try:
+            updates = harness.tg_call(config, "getUpdates", offset=offset, timeout=50)
+            backoff = 1
+        except Exception as exc:  # noqa: BLE001
+            harness.log(f"getUpdates error: {exc}; backoff {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+        if not updates:
+            continue
+        for update in updates:
+            offset = int(update["update_id"]) + 1
+            msg = update.get("message") or update.get("edited_message") or {}
+            sender = str((msg.get("from") or {}).get("id", ""))
+            text = msg.get("text", "")
+            if sender != owner:
+                harness.log(f"ignoring message from unauthorized id {sender}")
+                continue
+            try:
+                handle(config, text)
+            except Exception as exc:  # noqa: BLE001
+                harness.log(f"handler error for {text!r}: {exc}")
+                try:
+                    harness.tg_send(config, f"Error procesando '{text}': {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
+        with harness.StateLock():
+            state = harness.load_state()
+            state["telegram_offset"] = offset
+            harness.save_state(state)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

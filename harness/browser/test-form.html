@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Test Application Form</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: 2rem auto; }
+    label { display: block; margin-top: 0.8rem; font-weight: 600; }
+    input, select { width: 100%; padding: 0.4rem; box-sizing: border-box; }
+    .row { display: flex; gap: 1rem; }
+    .row > div { flex: 1; }
+    button { margin-top: 1.5rem; padding: 0.6rem 1.2rem; }
+  </style>
+</head>
+<body>
+  <h1>Apply for Platform Engineer</h1>
+  <form onsubmit="event.preventDefault(); document.getElementById('done').hidden=false;">
+    <div class="row">
+      <div>
+        <label for="first_name">First Name *</label>
+        <input id="first_name" name="first_name" required />
+      </div>
+      <div>
+        <label for="last_name">Last Name *</label>
+        <input id="last_name" name="last_name" required />
+      </div>
+    </div>
+
+    <label for="email">Email *</label>
+    <input id="email" name="email" type="email" required />
+
+    <label for="phone">Phone</label>
+    <input id="phone" name="phone" type="tel" />
+
+    <label for="location">Location (City)</label>
+    <input id="location" name="location" />
+
+    <label for="linkedin">LinkedIn Profile</label>
+    <input id="linkedin" name="urls[LinkedIn]" type="url" />
+
+    <label for="current_company">Current Company</label>
+    <input id="current_company" name="current_company" />
+
+    <label for="salary">Expected Salary *</label>
+    <input id="salary" name="salary_expectation" required />
+
+    <label for="dob">Date of Birth *</label>
+    <input id="dob" name="date_of_birth" type="date" required />
+
+    <label for="gender">Gender (optional)</label>
+    <select id="gender" name="gender">
+      <option value="">-- Select --</option>
+      <option>Male</option>
+      <option>Female</option>
+      <option>Prefer not to say</option>
+    </select>
+
+    <label for="start">Earliest Start Date *</label>
+    <input id="start" name="availability" type="date" required />
+
+    <label for="hear">How did you hear about us?</label>
+    <select id="hear" name="how_did_you_hear">
+      <option value="">-- Select --</option>
+      <option>Company website</option>
+      <option>LinkedIn</option>
+      <option>Referral</option>
+      <option>Other</option>
+    </select>
+
+    <fieldset>
+      <legend>Do you require visa sponsorship? *</legend>
+      <label><input type="radio" name="sponsorship" value="no" /> No</label>
+      <label><input type="radio" name="sponsorship" value="yes" /> Yes</label>
+    </fieldset>
+
+    <label for="resume">Resume/CV *</label>
+    <input id="resume" name="resume" type="file" required />
+
+    <label for="cover">Cover Letter</label>
+    <input id="cover" name="cover_letter" type="file" />
+
+    <button type="submit">Submit Application</button>
+  </form>
+  <p id="done" hidden>Application submitted (test).</p>
+</body>
+</html>

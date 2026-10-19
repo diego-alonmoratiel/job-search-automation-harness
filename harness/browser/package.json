@@ -1,0 +1,8 @@
+{
+  "name": "harness-browser",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "latest"
+  }
+}

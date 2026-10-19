@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""jobctl - command-line entry point for the job-search automation harness.
+
+Subcommands:
+  daily [focus]     run /scrape + /rank, build the shortlist, send it to Telegram
+  apply <n|url>     run /apply for a shortlisted offer (by number or URL)
+  resend            re-send the current shortlist
+  status            send a status summary to Telegram
+  notify <text>     send an arbitrary message to the owner
+  fscheck           alert on Telegram if the root filesystem went read-only
+  api-check         confirm the provider/model responds; alert on failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import harness  # noqa: E402
+
+
+def cmd_daily(config: dict, args) -> int:
+    harness.log("daily: start")
+    with harness.StateLock():
+        state = harness.load_state()
+
+    rc_s, out_s, err_s, model_s = harness.run_opencode(config, "scrape", "scrape", args.focus or "")
+    state = harness.load_state()
+    state["last_scrape"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    harness.save_state(state)
+    if rc_s != 0:
+        harness.log(f"scrape rc={rc_s}: {err_s[:300]}")
+        harness.tg_send(config, f"/scrape ha fallado (rc={rc_s}, modelo={model_s}). Reviso logs.")
+        # do not abort: rank may still surface previously scraped jobs
+    else:
+        harness.log(f"scrape ok (model={model_s})")
+
+    # Recover any entries parked by a previous interrupted run.
+    harness.restore_deferred(config)
+    cap = int(config.get("RANK_MAX_NEW", "40"))
+    parked = harness.prepare_rank_batch(config, cap)
+    rank_args = args.focus or ""
+    rc_r, out_r, err_r, model_r = harness.run_opencode(config, "rank", "rank", rank_args)
+    restored = harness.restore_deferred(config)
+    if parked:
+        harness.log(f"rank batch: parked {parked}, restored {restored}")
+    state = harness.load_state()
+    state["last_rank"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if rc_r != 0:
+        harness.log(f"rank rc={rc_r}: {err_r[:300]}")
+
+    rows = harness.build_shortlist(config, args.size)
+    state = harness.load_state()
+    state["shortlist"] = rows
+    offered = set(state.get("offered_urls", []))
+    offered.update(r["url"] for r in rows)
+    state["offered_urls"] = sorted(offered)
+    harness.save_state(state)
+
+    harness.tg_send(config, harness.render_shortlist(rows))
+    harness.log(f"daily: done, {len(rows)} offers (scrape rc={rc_s}, rank rc={rc_r})")
+    return 0 if rows else 0
+
+
+def _pdf_snapshot(aijob: Path) -> set[str]:
+    files: set[str] = set()
+    for sub in ("cv", "cover_letters"):
+        d = aijob / sub
+        if d.is_dir():
+            files.update(str(p) for p in d.glob("*.pdf"))
+    return files
+
+
+def _pdfs_since(aijob: Path, start: float) -> list[str]:
+    """PDFs in cv/ and cover_letters/ written at or after `start` (mtime based).
+
+    mtime-based detection also catches regenerated files with an unchanged name,
+    which a set difference would miss.
+    """
+    out: list[str] = []
+    for sub in ("cv", "cover_letters"):
+        d = aijob / sub
+        if d.is_dir():
+            for p in d.glob("*.pdf"):
+                try:
+                    if p.stat().st_mtime >= start - 1:
+                        out.append(str(p))
+                except OSError:
+                    pass
+    return sorted(out)
+
+
+def cmd_apply(config: dict, args) -> int:
+    target = args.target
+    state = harness.load_state()
+    url = target
+    company = title = ""
+
+    if target.isdigit():
+        idx = int(target)
+        rows = state.get("shortlist", [])
+        match = next((r for r in rows if r.get("n") == idx), None)
+        if not match:
+            harness.tg_send(config, f"No hay oferta numero {idx} en la shortlist actual.")
+            return 2
+        url = match["url"]
+        company = match.get("company", "")
+        title = match.get("title", "")
+
+    aijob = Path(config["AIJOB_DIR"])
+    start = time.time()
+    harness.tg_send(config, f"Preparando candidatura para {company or url} ... (puede tardar)")
+
+    rc, out, err, model = harness.run_opencode(config, "apply", "apply", url)
+    new_pdfs = _pdfs_since(aijob, start)
+
+    state = harness.load_state()
+    app = state["applications"].get(url, {})
+    app.update(
+        {
+            "company": company or app.get("company", ""),
+            "title": title or app.get("title", ""),
+            "url": url,
+            "stage": "drafted" if rc == 0 else "failed",
+            "model": model,
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+    )
+    if new_pdfs:
+        app["pdfs"] = new_pdfs
+    state["applications"][url] = app
+    if rc == 0:
+        state["current"] = url
+    harness.save_state(state)
+
+    if rc != 0:
+        harness.log(f"apply rc={rc}: {err[:500]}")
+        harness.tg_send(config, f"/apply ha fallado para {company or url} (rc={rc}, modelo={model}).")
+        return rc
+
+    if new_pdfs:
+        for pdf in new_pdfs:
+            try:
+                harness.tg_send_document(config, Path(pdf), caption=f"{company or url} - {Path(pdf).name}")
+            except Exception as exc:  # noqa: BLE001
+                harness.log(f"sendDocument failed for {pdf}: {exc}")
+        harness.tg_send(
+            config,
+            f"Borradores de {company or url} listos. Responde 'ok' para RELLENAR el formulario, "
+            "o 'no' para dejarlo.",
+        )
+    else:
+        harness.tg_send(
+            config,
+            f"/apply de {company or url} termino sin PDFs nuevos (revisa el log). "
+            "Si los ficheros ya existian, puede que se hayan regenerado igual.",
+        )
+    harness.log(f"apply done url={url} pdfs={len(new_pdfs)}")
+    return 0
+
+
+def _resolve_target(state: dict, target: str) -> dict:
+    if target.isdigit():
+        match = next((r for r in state.get("shortlist", []) if r.get("n") == int(target)), None)
+        return match or {}
+    return {"url": target}
+
+
+def _app_pdfs(state: dict, url: str) -> tuple[str | None, str | None]:
+    pdfs = state.get("applications", {}).get(url, {}).get("pdfs") or []
+    cv = next((p for p in pdfs if "/cv/" in p), None)
+    cover = next((p for p in pdfs if "cover" in Path(p).name.lower()), None)
+    return cv, cover
+
+
+def _merged_answers(state: dict, url: str) -> str:
+    """Merge the base answer bank with this application's overrides into a temp file."""
+    base = json.loads((harness.CONFIG_DIR / "answers.json").read_text(encoding="utf-8"))
+    base.update(state.get("applications", {}).get(url, {}).get("overrides", {}))
+    path = Path("/tmp") / f"harness-answers-{hashlib.md5(url.encode()).hexdigest()[:8]}.json"
+    path.write_text(json.dumps(base, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
+CDP_PORT = 9222
+
+
+def _computer_use_task(url: str, port: int, gaps: list, answers: dict) -> str:
+    lines = [f'- "{g.get("descriptor")}" -> {answers.get(g.get("key"))}' for g in gaps]
+    return (
+        f"A Chromium page is open over CDP on port {port}, showing the job application form at {url}.\n"
+        "Some required fields are still empty. Fill ONLY the fields listed below, with the given "
+        "values. Do NOT submit. Do NOT change fields that are already filled. For custom dropdowns, "
+        "open the control and pick the matching option.\n"
+        "Fields to fill:\n" + "\n".join(lines) + "\n"
+        "When finished, reply with a one-line summary."
+    )
+
+
+def cmd_fill(config: dict, args) -> int:
+    state = harness.load_state()
+    entry = _resolve_target(state, args.target)
+    url = entry.get("url") or args.target
+    company = entry.get("company", "")
+    cv, cover = _app_pdfs(state, url)
+    if not cv:
+        harness.tg_send(config, f"No encuentro el CV en PDF para {company or url}. Corre primero la candidatura (jobctl apply).")
+        return 2
+
+    app = state.get("applications", {}).get(url, {})
+    app["url"] = url
+    app["company"] = company or app.get("company", "")
+
+    if not harness.launch_chrome(config, url, CDP_PORT):
+        harness.tg_send(config, "No pude abrir el navegador en la Pi.")
+        return 1
+
+    answers_path = _merged_answers(state, url)
+    shot = "/tmp/harness-fill.png"
+    result = harness.run_browser_fill(
+        config, url, cv=cv, cover=cover, screenshot=shot, answers_path=answers_path,
+        cdp_port=CDP_PORT, no_navigate=getattr(args, "no_navigate", False),
+    )
+    if result.get("error"):
+        harness.log(f"fill error: {result}")
+        harness.tg_send(config, f"Fallo al rellenar: {result.get('error')}")
+        return 1
+
+    if result.get("stuck"):
+        state.setdefault("applications", {})[url] = app
+        app["stage"] = "stuck"
+        state["stuck"] = {"url": url, "company": app.get("company", ""), "reason": result["stuck"].get("reason")}
+        harness.save_state(state)
+        harness.tg_send(
+            config,
+            f"Me he atascado en {app.get('company') or url} ({result['stuck'].get('reason')}).\n"
+            "Opciones:\n"
+            "- Mandame un link directo a la oferta o al formulario y lo reapunto.\n"
+            "- O resuelvelo tu por VNC y dime 'fill' para reintentar.",
+        )
+        return 0
+
+    # Computer-use fallback: known-answer fields the DOM could not fill.
+    merged = json.loads(Path(answers_path).read_text(encoding="utf-8"))
+    gaps = [f for f in result.get("required_unfilled", []) if f.get("key") and merged.get(f.get("key"))]
+    if gaps:
+        task = _computer_use_task(url, CDP_PORT, gaps, merged)
+        rc, out, err = harness.run_computer_use(config, task, CDP_PORT)
+        harness.log(f"computer-use fallback rc={rc} gaps={len(gaps)}")
+        if rc == 0:
+            harness.run_browser_fill(
+                config, url, screenshot=shot, answers_path=answers_path,
+                cdp_port=CDP_PORT, no_navigate=True, screenshot_only=True,
+            )
+
+    verify = result.get("needs_verify", [])
+    if verify:
+        state.setdefault("applications", {})[url] = app
+        app["stage"] = "needs_verify"
+        state["pending_input"] = {"url": url, "company": app["company"], "type": "verify_code", "fields": verify}
+        state["stuck"] = None
+        state["current"] = url
+        harness.save_state(state)
+        harness.tg_send(
+            config,
+            f"El portal de {app['company'] or url} ha pedido un codigo de verificacion "
+            "(te lo habra enviado a tu email). Pasamelo aqui y lo introduzco sin recargar.",
+        )
+        return 0
+
+    needs = result.get("needs_input", [])
+    if needs:
+        state.setdefault("applications", {})[url] = app
+        app["stage"] = "needs_input"
+        state["pending_input"] = {"url": url, "company": app["company"], "fields": needs}
+        state["stuck"] = None
+        state["current"] = url
+        harness.save_state(state)
+        first = needs[0]
+        label = first.get("descriptor") or first.get("key")
+        harness.tg_send(
+            config,
+            f"El formulario de {app['company'] or url} pide un dato que no relleno solo:\n"
+            f"  {label}\nRespondeme el valor (o 'skip' para dejarlo en blanco).",
+        )
+        return 0
+
+    filled = result.get("filled", [])
+    missing = result.get("required_unfilled", [])
+    try:
+        harness.tg_send_document(config, Path(shot), caption=f"Borrador de formulario - {app['company'] or url}")
+    except Exception as exc:  # noqa: BLE001
+        harness.log(f"sendDocument screenshot failed: {exc}")
+    summary = [f"Formulario de {app['company'] or url}: {len(filled)} campos rellenos."]
+    if gaps:
+        summary.append(f"Respaldo con computer use aplicado a {len(gaps)} campos.")
+    if missing:
+        summary.append("Campos que no he podido rellenar (revisalos a mano):")
+        summary += [f"  - {(m.get('descriptor') or m.get('key'))[:80]}" for m in missing]
+    summary.append("Responde 'ok' para ENVIAR, o 'no' para cancelar.")
+    harness.tg_send(config, "\n".join(summary))
+    app["stage"] = "awaiting_ok"
+    app["fill_missing"] = missing
+    state["pending_input"] = None
+    state["stuck"] = None
+    state["current"] = url
+    state.setdefault("applications", {})[url] = app
+    harness.save_state(state)
+    return 0
+
+
+def cmd_submit(config: dict, args) -> int:
+    state = harness.load_state()
+    entry = _resolve_target(state, args.target)
+    url = entry.get("url") or args.target
+    company = entry.get("company", "")
+    cv, cover = _app_pdfs(state, url)
+    answers_path = _merged_answers(state, url)
+    if not harness.launch_chrome(config, url, CDP_PORT):
+        harness.tg_send(config, "No pude abrir el navegador en la Pi.")
+        return 1
+    result = harness.run_browser_fill(
+        config, url, cv=cv, cover=cover, submit=True, answers_path=answers_path,
+        cdp_port=CDP_PORT, no_navigate=True,
+    )
+    if result.get("error") or not result.get("submitted"):
+        reason = result.get("error") or result.get("submit_error") or "desconocido"
+        state["stuck"] = {"url": url, "company": company, "reason": f"submit fallo: {reason}"}
+        state["current"] = url
+        app = state.get("applications", {}).get(url, {})
+        app["stage"] = "stuck"
+        state.setdefault("applications", {})[url] = app
+        harness.save_state(state)
+        harness.log(f"submit failed url={url}: {reason}")
+        harness.tg_send(
+            config,
+            f"No se pudo enviar {company or url}: {reason}\n"
+            "Puede ser un modal/boton que el DOM no ve (p.ej. LinkedIn Easy Apply). Opciones:\n"
+            "- Mandame un link directo al formulario y lo reapunto.\n"
+            "- O resuelvelo tu por VNC.",
+        )
+        return 1
+    app = state.get("applications", {}).get(url, {})
+    app["stage"] = "sent"
+    state.setdefault("applications", {})[url] = app
+    state["current"] = None
+    state["stuck"] = None
+    harness.save_state(state)
+    harness.tg_send(config, f"Solicitud enviada: {company or url}")
+    harness.log(f"submitted {url}")
+    return 0
+
+
+def cmd_verify(config: dict, args) -> int:
+    """Fill a verification code on the currently open page (no reload) and continue."""
+    state = harness.load_state()
+    url = args.target
+    code = args.code
+    answers_path = _merged_answers(state, url)
+    if not harness.launch_chrome(config, url, CDP_PORT):
+        harness.tg_send(config, "No pude abrir el navegador en la Pi.")
+        return 1
+    result = harness.run_browser_fill(
+        config, url, answers_path=answers_path, cdp_port=CDP_PORT, no_navigate=True, verify_code=code
+    )
+    if result.get("error") or not result.get("verified"):
+        harness.tg_send(config, f"No pude introducir el codigo: {result.get('error') or 'no encontre el campo'}")
+        return 1
+    state = harness.load_state()
+    state["pending_input"] = None
+    harness.save_state(state)
+    harness.tg_send(config, "Codigo introducido. Continua el relleno...")
+    return cmd_fill(config, SimpleNamespace(target=url, no_navigate=True))
+
+
+def _state_summary(state: dict) -> str:
+    lines = []
+    stuck = state.get("stuck")
+    if stuck:
+        lines.append(f"Atascado en: {stuck.get('url')} ({stuck.get('reason')})")
+    pend = state.get("pending_input")
+    if pend:
+        fields = ", ".join((f.get("descriptor") or f.get("key") or "")[:60] for f in pend.get("fields", []))
+        lines.append(f"Pregunta pendiente para {pend.get('url')}: {fields}")
+    awaiting = [u for u, a in state.get("applications", {}).items() if a.get("stage") == "awaiting_ok"]
+    if awaiting:
+        lines.append("Esperando tu 'ok' para enviar: " + ", ".join(awaiting))
+    rows = state.get("shortlist", [])
+    if rows:
+        lines.append("Shortlist actual: " + "; ".join(f"{r.get('n')}. {r.get('company')} - {r.get('title')}" for r in rows))
+    apps = state.get("applications", {})
+    if apps:
+        lines.append("Candidaturas: " + "; ".join(f"{a.get('company') or u} [{a.get('stage')}]" for u, a in apps.items()))
+    return "\n".join(lines) or "(sin estado relevante)"
+
+
+def cmd_score(config: dict, args) -> int:
+    """Score a single posting (fit + language/location gates). No drafting, no browser."""
+    state = harness.load_state()
+    target = args.target
+    if target.isdigit():
+        match = next((r for r in state.get("shortlist", []) if r.get("n") == int(target)), None)
+        if match:
+            target = match.get("url") or target
+    rc, out, err, model = harness.run_opencode(config, "score", "score", target, timeout=300)
+    reply = (out or "").strip()
+    if not reply:
+        reply = f"No he podido puntuar {target}."
+        if err.strip():
+            reply += f"\n(error: {err.strip()[:200]})"
+    harness.tg_send(config, reply)
+    return 0
+
+
+def cmd_say(config: dict, args) -> int:
+    state = harness.load_state()
+    prompt = (
+        "Contexto del harness:\n"
+        + _state_summary(state)
+        + "\n\nMensaje del propietario por Telegram:\n"
+        + args.text
+    )
+    rc, out, err, model = harness.run_opencode(config, "chat", "chat", prompt, timeout=600)
+    reply = (out or "").strip()
+    if not reply:
+        reply = "No he podido interpretar tu mensaje."
+        if err.strip():
+            reply += f"\n(error: {err.strip()[:200]})"
+    harness.tg_send(config, reply)
+    return 0
+
+
+def cmd_retarget(config: dict, args) -> int:
+    state = harness.load_state()
+    new_url = args.target
+    stuck = state.get("stuck") or {}
+    apps = state.get("applications", {})
+    src_url = stuck.get("url") or state.get("current")
+    if (not src_url or not apps.get(src_url, {}).get("pdfs")) and apps:
+        candidates = [u for u, a in apps.items() if a.get("pdfs") and a.get("stage") != "sent"]
+        if candidates:
+            src_url = max(candidates, key=lambda u: apps[u].get("updated", ""))
+    src = apps.get(src_url, {}) if src_url else {}
+    if not src.get("pdfs"):
+        harness.tg_send(config, f"No tengo CV/carta previos que reutilizar; redacto de cero para {new_url}.")
+        return cmd_apply(config, SimpleNamespace(target=new_url))
+    app = {
+        "url": new_url,
+        "company": src.get("company", ""),
+        "title": src.get("title", ""),
+        "pdfs": src.get("pdfs", []),
+        "overrides": src.get("overrides", {}),
+        "stage": "retargeted",
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    state.setdefault("applications", {})[new_url] = app
+    state["stuck"] = None
+    state["current"] = new_url
+    harness.save_state(state)
+    harness.tg_send(config, f"Reapunto a {new_url} reutilizando el CV/carta...")
+    return cmd_fill(config, SimpleNamespace(target=new_url))
+
+
+def cmd_resend(config: dict, _args) -> int:
+    state = harness.load_state()
+    harness.tg_send(config, harness.render_shortlist(state.get("shortlist", [])))
+    return 0
+
+
+def cmd_notify(config: dict, args) -> int:
+    harness.tg_send(config, args.text)
+    return 0
+
+
+def cmd_status(config: dict, _args) -> int:
+    state = harness.load_state()
+    apps = state.get("applications", {})
+    by_stage: dict[str, int] = {}
+    for app in apps.values():
+        by_stage[app.get("stage", "?")] = by_stage.get(app.get("stage", "?"), 0) + 1
+    lines = [
+        "Estado del harness",
+        f"ultimo scrape: {state.get('last_scrape')}",
+        f"ultimo rank:   {state.get('last_rank')}",
+        f"shortlist:     {len(state.get('shortlist', []))} ofertas",
+        f"candidaturas:  {json.dumps(by_stage)}",
+    ]
+    harness.tg_send(config, "\n".join(lines))
+    return 0
+
+
+def cmd_fscheck(config: dict, _args) -> int:
+    try:
+        out = subprocess.run(
+            ["findmnt", "-no", "OPTIONS", "/"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if "ro" in {o.strip() for o in out.split(",")}:
+        harness.log("fscheck: root filesystem is READ-ONLY")
+        harness.tg_send(config, "ALERTA: el sistema de ficheros raiz esta en SOLO LECTURA. La Pi necesita atencion.")
+        return 1
+    return 0
+
+
+def cmd_api_check(config: dict, _args) -> int:
+    rc, out, err, model = harness.run_opencode(
+        config, "rank", "rank", "--top 1", timeout=120, allow_fallback=True
+    )
+    if rc != 0:
+        harness.tg_send(config, f"ALERTA: el proveedor de modelos no responde (rc={rc}, modelo={model}).")
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="jobctl")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_daily = sub.add_parser("daily")
+    p_daily.add_argument("focus", nargs="?", default="")
+    p_daily.add_argument("--size", type=int, default=None)
+    p_daily.set_defaults(func=cmd_daily)
+
+    p_apply = sub.add_parser("apply")
+    p_apply.add_argument("target")
+    p_apply.set_defaults(func=cmd_apply)
+
+    sub.add_parser("resend").set_defaults(func=cmd_resend)
+
+    p_fill = sub.add_parser("fill")
+    p_fill.add_argument("target")
+    p_fill.set_defaults(func=cmd_fill)
+
+    p_submit = sub.add_parser("submit")
+    p_submit.add_argument("target")
+    p_submit.set_defaults(func=cmd_submit)
+
+    p_retarget = sub.add_parser("retarget")
+    p_retarget.add_argument("target")
+    p_retarget.set_defaults(func=cmd_retarget)
+
+    p_verify = sub.add_parser("verify")
+    p_verify.add_argument("target")
+    p_verify.add_argument("code")
+    p_verify.set_defaults(func=cmd_verify)
+
+    p_say = sub.add_parser("say")
+    p_say.add_argument("text")
+    p_say.set_defaults(func=cmd_say)
+
+    p_score = sub.add_parser("score")
+    p_score.add_argument("target")
+    p_score.set_defaults(func=cmd_score)
+
+    p_notify = sub.add_parser("notify")
+    p_notify.add_argument("text")
+    p_notify.set_defaults(func=cmd_notify)
+
+    sub.add_parser("status").set_defaults(func=cmd_status)
+    sub.add_parser("fscheck").set_defaults(func=cmd_fscheck)
+    sub.add_parser("api-check").set_defaults(func=cmd_api_check)
+
+    args = parser.parse_args()
+    config = harness.load_config()
+
+    if args.cmd not in ("fscheck",):
+        if not config.get("TELEGRAM_BOT_TOKEN") or not config.get("TELEGRAM_OWNER_ID"):
+            harness.log("WARNING: Telegram credentials are not configured")
+
+    return args.func(config, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
